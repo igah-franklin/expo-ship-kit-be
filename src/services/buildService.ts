@@ -137,13 +137,17 @@ async function generateKeyAndCsr(dir: string): Promise<{ privateKeyPath: string;
 }
 
 async function listIosDistributionCertificates(auth: Record<string, string>): Promise<any[]> {
-  const url = 'https://api.appstoreconnect.apple.com/v1/certificates?filter[certificateType]=IOS_DISTRIBUTION&limit=200';
+  const url = 'https://api.appstoreconnect.apple.com/v1/certificates?limit=200';
   const res = await fetch(url, { headers: auth });
   if (!res.ok) {
     throw new Error(`List certificates HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`);
   }
   const data: any = await res.json();
-  return data?.data || [];
+  const certs = data?.data || [];
+  return certs.filter((c: any) => 
+    c.attributes?.certificateType === 'IOS_DISTRIBUTION' || 
+    c.attributes?.certificateType === 'DISTRIBUTION'
+  );
 }
 
 async function revokeCertificate(auth: Record<string, string>, certId: string): Promise<void> {
@@ -185,7 +189,7 @@ async function ensureDistributionCertificate(
 
   let attempt = await createCert();
   if (!attempt.success) {
-    const isLimit = /maximum number of certificates|exceeded.*limit|too many.*certificates/i.test(attempt.error || '');
+    const isLimit = /maximum number of certificates|exceeded.*limit|too many.*certificates|already have a current.*certificate/i.test(attempt.error || '');
     if (isLimit) {
       const certs = await listIosDistributionCertificates(auth);
       if (certs.length > 0) {
@@ -227,7 +231,10 @@ async function ensureDistributionCertificate(
     '-inkey', `"${privateKeyPath}"`,
     '-out', `"${rawP12Path}"`,
     '-passout', `pass:${p12Password}`,
-    '-name', '"Hangar Distribution Cert"'
+    '-name', '"Hangar Distribution Cert"',
+    '-legacy',
+    '-provider', 'default',
+    '-provider', 'legacy'
   ], {
     cwd: dir,
     env: process.env,
@@ -556,32 +563,64 @@ export async function runBuild(
       EAS_BUILD_NO_EXPO_GO_WARNING: 'true',
     };
 
-    // ── Step 6b: Install dependencies (uploaded ZIPs lack node_modules) ──
-    const hasNodeModules = fs.existsSync(path.join(projectRoot, 'node_modules'));
+    // ── Step 6b: Install dependencies and sync lockfile ──
     const hasPackageJson = fs.existsSync(path.join(projectRoot, 'package.json'));
 
-    if (!hasNodeModules && hasPackageJson) {
-      await appendLog('Installing project dependencies (npm install)...');
+    if (hasPackageJson) {
+      const hasYarnLock = fs.existsSync(path.join(projectRoot, 'yarn.lock'));
+      const hasPnpmLock = fs.existsSync(path.join(projectRoot, 'pnpm-lock.yaml'));
+      
+      let pm = 'npm';
+      let installCmd = 'npm';
+      let installArgs = ['install', '--legacy-peer-deps'];
+      let logPrefix = 'NPM';
+
+      if (hasYarnLock) {
+        pm = 'yarn';
+        installCmd = 'yarn';
+        installArgs = ['install', '--non-interactive'];
+        logPrefix = 'YARN';
+      } else if (hasPnpmLock) {
+        pm = 'pnpm';
+        installCmd = 'pnpm';
+        installArgs = ['install'];
+        logPrefix = 'PNPM';
+      } else {
+        // For npm, inject legacy-peer-deps to .npmrc to prevent EAS build peer dependency failures
+        try {
+          const npmrcPath = path.join(projectRoot, '.npmrc');
+          let npmrcContent = '';
+          if (fs.existsSync(npmrcPath)) {
+            npmrcContent = fs.readFileSync(npmrcPath, 'utf8');
+          }
+          if (!npmrcContent.includes('legacy-peer-deps')) {
+            fs.writeFileSync(npmrcPath, npmrcContent + '\nlegacy-peer-deps=true\n');
+            await appendLog('Added legacy-peer-deps=true to .npmrc to prevent EAS build peer dependency failures.');
+          }
+        } catch (npmrcErr: any) {
+          await appendLog(`Warning: Failed to configure .npmrc: ${npmrcErr.message}`);
+        }
+      }
+
+      await appendLog(`Installing project dependencies and syncing lockfile (${pm} install)...`);
       const installResult = await spawnAsync(
-        'npm',
-        ['install', '--legacy-peer-deps'],
+        installCmd,
+        installArgs,
         { cwd: projectRoot, env, timeoutMs: 180000 },
         (data) => {
           const lines = data.split('\n');
           lines.forEach((line: string) => {
-            if (line.trim()) appendLog(`[NPM] ${line.trim()}`);
+            if (line.trim()) appendLog(`[${logPrefix}] ${line.trim()}`);
           });
         }
       );
 
       if (!installResult.success) {
-        await appendLog('Warning: npm install had issues, attempting to continue...');
-        await appendLog(`[NPM OUTPUT] ${installResult.output.substring(0, 500)}`);
+        await appendLog(`Warning: ${pm} install had issues, attempting to continue...`);
+        await appendLog(`[${logPrefix} OUTPUT] ${installResult.output.substring(0, 500)}`);
       } else {
-        await appendLog('Dependencies installed successfully.');
+        await appendLog('Dependencies and lockfile synced successfully.');
       }
-    } else if (hasNodeModules) {
-      await appendLog('node_modules already present, skipping npm install.');
     } else {
       await appendLog('Warning: No package.json found. Skipping dependency installation.');
     }
