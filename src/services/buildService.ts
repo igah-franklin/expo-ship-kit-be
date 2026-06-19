@@ -68,7 +68,7 @@ function spawnAsync(
 }
 
 /** Validate Expo token via GraphQL API and return username */
-async function validateExpoToken(
+export async function validateExpoToken(
   token: string
 ): Promise<{ valid: boolean; username?: string; error?: string }> {
   try {
@@ -89,6 +89,27 @@ async function validateExpoToken(
     return { valid: true, username };
   } catch (err: any) {
     return { valid: false, error: `Network error reaching Expo: ${err.message}` };
+  }
+}
+
+/** Validate Apple Developer credentials by signing a test JWT and hitting ConnectAPI */
+export async function validateAppleCredentials(
+  issuerId: string,
+  keyId: string,
+  p8KeyContent: string
+): Promise<{ valid: boolean; error?: string }> {
+  try {
+    const jwtToken = signAscJwt({ p8Content: p8KeyContent, keyId, issuerId });
+    const res = await fetch('https://api.appstoreconnect.apple.com/v1/bundleIds?limit=1', {
+      headers: { Authorization: `Bearer ${jwtToken}` }
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      return { valid: false, error: `Apple API returned HTTP ${res.status}: ${text.slice(0, 300)}` };
+    }
+    return { valid: true };
+  } catch (err: any) {
+    return { valid: false, error: `Apple ASC Key Authentication failed: ${err.message}` };
   }
 }
 
@@ -124,7 +145,7 @@ async function generateKeyAndCsr(dir: string): Promise<{ privateKeyPath: string;
   // Generate CSR
   const genCsr = await spawnAsync('openssl', [
     'req', '-new', '-key', privateKeyPath, '-out', csrPath,
-    '-subj', '"/CN=Hangar Distribution Cert/O=Hangar/C=US"'
+    '-subj', '"/CN=Expoship Distribution Cert/O=Expoship/C=US"'
   ], {
     cwd: dir,
     env: process.env,
@@ -223,7 +244,7 @@ async function ensureDistributionCertificate(
 
   fs.writeFileSync(rawCerPath, Buffer.from(certificateContentB64, 'base64'));
 
-  const p12Password = 'hangar';
+  const p12Password = 'expoship';
   
   const bundleP12 = await spawnAsync('openssl', [
     'pkcs12', '-export',
@@ -231,7 +252,7 @@ async function ensureDistributionCertificate(
     '-inkey', `"${privateKeyPath}"`,
     '-out', `"${rawP12Path}"`,
     '-passout', `pass:${p12Password}`,
-    '-name', '"Hangar Distribution Cert"',
+    '-name', '"Expoship Distribution Cert"',
     '-legacy',
     '-provider', 'default',
     '-provider', 'legacy'
@@ -468,7 +489,7 @@ async function createProvisioningProfile(
     }
   }
 
-  const profileName = `Hangar AppStore ${bundleId} ${Math.floor(Date.now() / 1000)}`;
+  const profileName = `Expoship AppStore ${bundleId} ${Math.floor(Date.now() / 1000)}`;
   const createProfileRes = await fetch('https://api.appstoreconnect.apple.com/v1/profiles', {
     method: 'POST',
     headers: { ...auth, 'Content-Type': 'application/json' },
@@ -754,7 +775,7 @@ export async function runBuild(
           provisioningProfilePath: path.relative(projectRoot, profilePath),
           distributionCertificate: {
             path: path.relative(projectRoot, p12Path),
-            password: 'hangar'
+            password: 'expoship'
           }
         }
       }
