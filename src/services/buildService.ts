@@ -137,13 +137,17 @@ async function generateKeyAndCsr(dir: string): Promise<{ privateKeyPath: string;
 }
 
 async function listIosDistributionCertificates(auth: Record<string, string>): Promise<any[]> {
-  const url = 'https://api.appstoreconnect.apple.com/v1/certificates?filter[certificateType]=IOS_DISTRIBUTION&limit=200';
+  const url = 'https://api.appstoreconnect.apple.com/v1/certificates?limit=200';
   const res = await fetch(url, { headers: auth });
   if (!res.ok) {
     throw new Error(`List certificates HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`);
   }
   const data: any = await res.json();
-  return data?.data || [];
+  const certs = data?.data || [];
+  return certs.filter((c: any) => 
+    c.attributes?.certificateType === 'IOS_DISTRIBUTION' || 
+    c.attributes?.certificateType === 'DISTRIBUTION'
+  );
 }
 
 async function revokeCertificate(auth: Record<string, string>, certId: string): Promise<void> {
@@ -185,7 +189,7 @@ async function ensureDistributionCertificate(
 
   let attempt = await createCert();
   if (!attempt.success) {
-    const isLimit = /maximum number of certificates|exceeded.*limit|too many.*certificates/i.test(attempt.error || '');
+    const isLimit = /maximum number of certificates|exceeded.*limit|too many.*certificates|already have a current.*certificate/i.test(attempt.error || '');
     if (isLimit) {
       const certs = await listIosDistributionCertificates(auth);
       if (certs.length > 0) {
@@ -227,7 +231,10 @@ async function ensureDistributionCertificate(
     '-inkey', `"${privateKeyPath}"`,
     '-out', `"${rawP12Path}"`,
     '-passout', `pass:${p12Password}`,
-    '-name', '"Hangar Distribution Cert"'
+    '-name', '"Hangar Distribution Cert"',
+    '-legacy',
+    '-provider', 'default',
+    '-provider', 'legacy'
   ], {
     cwd: dir,
     env: process.env,
@@ -244,11 +251,173 @@ async function ensureDistributionCertificate(
   return { certId, p12Path: rawP12Path };
 }
 
+function detectRequiredCapabilities(projectRoot: string, appJson: any): string[] {
+  const capabilities = new Set<string>();
+
+  // 1. Check app.json entitlements
+  const entitlements = appJson?.expo?.ios?.entitlements || {};
+  if (entitlements['com.apple.developer.applesignin']) {
+    capabilities.add('APPLE_ID_AUTH');
+  }
+  if (entitlements['aps-environment']) {
+    capabilities.add('PUSH_NOTIFICATIONS');
+  }
+  if (entitlements['com.apple.developer.associated-domains']) {
+    capabilities.add('ASSOCIATED_DOMAINS');
+  }
+  if (entitlements['com.apple.developer.icloud-container-identifiers'] || entitlements['com.apple.developer.icloud-services']) {
+    capabilities.add('ICLOUD');
+  }
+
+  // 2. Check app.json plugins
+  const plugins = appJson?.expo?.plugins || [];
+  plugins.forEach((p: any) => {
+    const pluginName = typeof p === 'string' ? p : (Array.isArray(p) ? p[0] : '');
+    if (pluginName === 'expo-apple-authentication') {
+      capabilities.add('APPLE_ID_AUTH');
+    }
+    if (pluginName === 'expo-notifications') {
+      capabilities.add('PUSH_NOTIFICATIONS');
+    }
+  });
+
+  // 3. Check package.json dependencies
+  try {
+    const pkgPath = path.join(projectRoot, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+      const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+      if (deps['expo-apple-authentication'] || deps['@react-native-apple-authentication/ios']) {
+        capabilities.add('APPLE_ID_AUTH');
+      }
+      if (deps['expo-notifications']) {
+        capabilities.add('PUSH_NOTIFICATIONS');
+      }
+    }
+  } catch (pkgErr) {
+    console.error('Error scanning package.json dependencies for capabilities:', pkgErr);
+  }
+
+  // 4. Check any local .entitlements files
+  try {
+    const findEntitlementsFiles = (dir: string): string[] => {
+      const results: string[] = [];
+      if (!fs.existsSync(dir)) return results;
+      const list = fs.readdirSync(dir);
+      for (const file of list) {
+        const filePath = path.join(dir, file);
+        const stat = fs.statSync(filePath);
+        if (stat && stat.isDirectory()) {
+          if (file !== 'node_modules' && file !== '.git' && file !== '.expo' && file !== '.next') {
+            results.push(...findEntitlementsFiles(filePath));
+          }
+        } else if (file.endsWith('.entitlements')) {
+          results.push(filePath);
+        }
+      }
+      return results;
+    };
+
+    const files = findEntitlementsFiles(projectRoot);
+    for (const file of files) {
+      const content = fs.readFileSync(file, 'utf8');
+      if (content.includes('com.apple.developer.applesignin')) {
+        capabilities.add('APPLE_ID_AUTH');
+      }
+      if (content.includes('aps-environment')) {
+        capabilities.add('PUSH_NOTIFICATIONS');
+      }
+      if (content.includes('com.apple.developer.associated-domains')) {
+        capabilities.add('ASSOCIATED_DOMAINS');
+      }
+      if (content.includes('com.apple.developer.icloud-container-identifiers') || content.includes('com.apple.developer.icloud-services')) {
+        capabilities.add('ICLOUD');
+      }
+    }
+  } catch (err) {
+    console.error('Error scanning entitlements:', err);
+  }
+
+  return Array.from(capabilities);
+}
+
+async function enableBundleIdCapabilities(
+  auth: Record<string, string>,
+  bundleResourceId: string,
+  capabilities: string[],
+  appendLog?: (msg: string) => Promise<void>
+): Promise<void> {
+  for (const cap of capabilities) {
+    try {
+      const url = 'https://api.appstoreconnect.apple.com/v1/bundleIdCapabilities';
+      const attributes: any = {
+        capabilityType: cap
+      };
+
+      if (cap === 'APPLE_ID_AUTH') {
+        attributes.settings = [
+          {
+            key: 'APPLE_ID_AUTH_APP_CONSENT',
+            options: [
+              {
+                key: 'PRIMARY_APP_CONSENT'
+              }
+            ]
+          }
+        ];
+      }
+
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { ...auth, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          data: {
+            type: 'bundleIdCapabilities',
+            attributes,
+            relationships: {
+              bundleId: {
+                data: {
+                  type: 'bundleIds',
+                  id: bundleResourceId
+                }
+              }
+            }
+          }
+        }),
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        const isAlreadyEnabled = text.includes('already exists') ||
+                                 text.includes('already enabled') ||
+                                 text.includes('ENTITY_EXISTS') ||
+                                 text.includes('ENTITY_ERROR.ENTITY_EXISTS');
+
+        if (isAlreadyEnabled) {
+          if (appendLog) await appendLog(`[ASC CAPABILITY] Capability ${cap} is already enabled.`);
+          console.log(`Capability ${cap} is already enabled.`);
+        } else {
+          if (appendLog) await appendLog(`[ASC CAPABILITY WARNING] Failed to enable capability ${cap} (HTTP ${res.status}): ${text}`);
+          console.warn(`Warning: Failed to enable capability ${cap} (HTTP ${res.status}): ${text}`);
+        }
+      } else {
+        if (appendLog) await appendLog(`[ASC CAPABILITY] Successfully enabled capability ${cap} for bundle ID.`);
+        console.log(`Successfully enabled capability ${cap} for bundle ID.`);
+      }
+    } catch (err: any) {
+      if (appendLog) await appendLog(`[ASC CAPABILITY WARNING] Failed to enable capability ${cap} due to error: ${err.message}`);
+      console.warn(`Warning: Failed to enable capability ${cap} due to network error: ${err.message}`);
+    }
+  }
+}
+
 async function createProvisioningProfile(
   auth: Record<string, string>,
   bundleId: string,
   certId: string,
-  dir: string
+  dir: string,
+  requiredCapabilities: string[] = [],
+  appendLog?: (msg: string) => Promise<void>
 ): Promise<string> {
   const searchUrl = `https://api.appstoreconnect.apple.com/v1/bundleIds?filter[identifier]=${encodeURIComponent(bundleId)}`;
   const searchRes = await fetch(searchUrl, { headers: auth });
@@ -278,6 +447,13 @@ async function createProvisioningProfile(
   }
   if (!bundleResourceId) {
     throw new Error(`Could not resolve bundleResourceId for ${bundleId}`);
+  }
+
+  // Enable required capabilities
+  if (requiredCapabilities.length > 0) {
+    await enableBundleIdCapabilities(auth, bundleResourceId, requiredCapabilities, appendLog);
+    if (appendLog) await appendLog('Waiting 20 seconds for Apple capability changes to propagate across their servers...');
+    await new Promise(resolve => setTimeout(resolve, 20000));
   }
 
   const listUrl = `https://api.appstoreconnect.apple.com/v1/profiles?filter[profileType]=IOS_APP_STORE&include=bundleId&limit=200`;
@@ -322,6 +498,97 @@ async function createProvisioningProfile(
   fs.writeFileSync(profilePath, Buffer.from(profileContentB64, 'base64'));
 
   return profilePath;
+}
+
+async function triggerEasBuildWithRetry(
+  projectRoot: string,
+  env: Record<string, string | undefined>,
+  buildId: string,
+  appendLog: (msg: string) => Promise<void>,
+  attemptNum: number = 1
+): Promise<void> {
+  const maxAttempts = 3;
+  await appendLog(`Triggering EAS production build for iOS (Attempt ${attemptNum}/${maxAttempts})...`);
+
+  let buildOutput = '';
+  const buildUrlRegex = /(https:\/\/expo\.dev\/accounts\/[\w-]+\/projects\/[\w-]+\/builds\/[\w-]+)/;
+
+  const success = await new Promise<boolean>((resolve) => {
+    const buildProcess = spawn(
+      'npx',
+      ['eas-cli', 'build', '--platform', 'ios', '--profile', 'production', '--non-interactive', '--no-wait'],
+      {
+        cwd: projectRoot,
+        env,
+        shell: true,
+      }
+    );
+
+    buildProcess.stdout.on('data', async (data) => {
+      const text = data.toString();
+      buildOutput += text;
+      const lines = text.split('\n');
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        await appendLog(`[EAS BUILD] ${line}`);
+
+        const match = line.match(buildUrlRegex);
+        if (match) {
+          const buildUrl = match[1];
+          await appendLog(`Detected Build URL: ${buildUrl}`);
+          await Build.findByIdAndUpdate(buildId, { buildUrl });
+        }
+      }
+    });
+
+    buildProcess.stderr.on('data', async (data) => {
+      const text = data.toString();
+      buildOutput += text;
+      const lines = text.split('\n');
+      for (const line of lines) {
+        if (line.trim()) {
+          await appendLog(`[EAS BUILD ERROR] ${line}`);
+        }
+      }
+    });
+
+    buildProcess.on('close', (code) => {
+      resolve(code === 0);
+    });
+
+    // 5 minutes safety timeout
+    setTimeout(() => {
+      buildProcess.kill();
+      resolve(false);
+    }, 300000);
+  });
+
+  if (success) {
+    await appendLog('EAS build command completed successfully.');
+    return;
+  }
+
+  // If failed, check for transient network errors to retry
+  const transientErrors = [
+    'ECONNRESET',
+    'ETIMEDOUT',
+    'Failed to upload',
+    'upload failed',
+    'socket hang up',
+    'fetch failed',
+    'network error'
+  ];
+
+  const isTransient = transientErrors.some(err => buildOutput.includes(err));
+
+  if (isTransient && attemptNum < maxAttempts) {
+    await appendLog(`Transient network error detected. Retrying in 5 seconds...`);
+    await new Promise(r => setTimeout(r, 5000));
+    return triggerEasBuildWithRetry(projectRoot, env, buildId, appendLog, attemptNum + 1);
+  }
+
+  throw new Error(`EAS build command failed with exit code 1. ${isTransient ? 'Max upload retries exceeded.' : ''}`);
 }
 
 // ─── Main Build Pipeline ────────────────────────────────────────────────────
@@ -455,12 +722,20 @@ export async function runBuild(
     );
     await appendLog(`✓ Provisioned iOS distribution certificate (ID: ${certId})`);
 
+    // Detect required capabilities
+    const requiredCaps = detectRequiredCapabilities(projectRoot, appJson);
+    if (requiredCaps.length > 0) {
+      await appendLog(`Detected required iOS capabilities from entitlements: ${requiredCaps.join(', ')}`);
+    }
+
     // Create provisioning profile
     const profilePath = await createProvisioningProfile(
       ascAuth,
       bundleIdentifier,
       certId,
-      credentialsDir
+      credentialsDir,
+      requiredCaps,
+      appendLog
     );
     await appendLog(`✓ Provisioned iOS App Store provisioning profile for bundle ID "${bundleIdentifier}"`);
 
@@ -556,32 +831,63 @@ export async function runBuild(
       EAS_BUILD_NO_EXPO_GO_WARNING: 'true',
     };
 
-    // ── Step 6b: Install dependencies (uploaded ZIPs lack node_modules) ──
-    const hasNodeModules = fs.existsSync(path.join(projectRoot, 'node_modules'));
+    // ── Step 6b: Install dependencies and sync lockfile ──
     const hasPackageJson = fs.existsSync(path.join(projectRoot, 'package.json'));
 
-    if (!hasNodeModules && hasPackageJson) {
-      await appendLog('Installing project dependencies (npm install)...');
+    if (hasPackageJson) {
+      const hasYarnLock = fs.existsSync(path.join(projectRoot, 'yarn.lock'));
+      const hasPnpmLock = fs.existsSync(path.join(projectRoot, 'pnpm-lock.yaml'));
+      
+      let pm = 'npm';
+      let installCmd = 'npm';
+      let installArgs = ['install', '--legacy-peer-deps'];
+      let logPrefix = 'NPM';
+
+      if (hasYarnLock) {
+        pm = 'yarn';
+        installCmd = 'yarn';
+        installArgs = ['install', '--non-interactive'];
+        logPrefix = 'YARN';
+      } else if (hasPnpmLock) {
+        pm = 'pnpm';
+        installCmd = 'pnpm';
+        installArgs = ['install'];
+        logPrefix = 'PNPM';
+      } else {
+        // For npm, inject legacy-peer-deps to .npmrc to prevent EAS build peer dependency failures
+        try {
+          const npmrcPath = path.join(projectRoot, '.npmrc');
+          let npmrcContent = '';
+          if (fs.existsSync(npmrcPath)) {
+            npmrcContent = fs.readFileSync(npmrcPath, 'utf8');
+          }
+          if (!npmrcContent.includes('legacy-peer-deps')) {
+            fs.writeFileSync(npmrcPath, npmrcContent + '\nlegacy-peer-deps=true\n');
+            await appendLog('Added legacy-peer-deps=true to .npmrc to prevent EAS build peer dependency failures.');
+          }
+        } catch (npmrcErr: any) {
+          await appendLog(`Warning: Failed to configure .npmrc: ${npmrcErr.message}`);
+        }
+      }
+
+      await appendLog(`Installing project dependencies and syncing lockfile (${pm} install)...`);
       const installResult = await spawnAsync(
-        'npm',
-        ['install', '--legacy-peer-deps'],
-        { cwd: projectRoot, env, timeoutMs: 180000 },
+        installCmd,
+        installArgs,
+        { cwd: projectRoot, env, timeoutMs: 600000 },
         (data) => {
           const lines = data.split('\n');
           lines.forEach((line: string) => {
-            if (line.trim()) appendLog(`[NPM] ${line.trim()}`);
+            if (line.trim()) appendLog(`[${logPrefix}] ${line.trim()}`);
           });
         }
       );
 
       if (!installResult.success) {
-        await appendLog('Warning: npm install had issues, attempting to continue...');
-        await appendLog(`[NPM OUTPUT] ${installResult.output.substring(0, 500)}`);
+        throw new Error(`Project dependency installation failed (${pm} install exited with non-zero code or timed out). Output: ${installResult.output.substring(0, 1000)}`);
       } else {
-        await appendLog('Dependencies installed successfully.');
+        await appendLog('Dependencies and lockfile synced successfully.');
       }
-    } else if (hasNodeModules) {
-      await appendLog('node_modules already present, skipping npm install.');
     } else {
       await appendLog('Warning: No package.json found. Skipping dependency installation.');
     }
@@ -623,59 +929,7 @@ export async function runBuild(
     await appendLog('Apple credentials configured via environment variables (ASC API Key, Team ID, Team Type).');
     await appendLog('Triggering EAS production build for iOS. Uploading assets to Expo Cloud...');
 
-    await new Promise<void>((resolve, reject) => {
-      const buildProcess = spawn(
-        'npx',
-        ['eas-cli', 'build', '--platform', 'ios', '--profile', 'production', '--non-interactive', '--no-wait'],
-        {
-          cwd: projectRoot,
-          env,
-          shell: true,
-        }
-      );
-
-      const buildUrlRegex = /(https:\/\/expo\.dev\/accounts\/[\w-]+\/projects\/[\w-]+\/builds\/[\w-]+)/;
-
-      buildProcess.stdout.on('data', async (data) => {
-        const text = data.toString();
-        const lines = text.split('\n');
-
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          await appendLog(`[EAS BUILD] ${line}`);
-
-          // Look for Expo Build URL
-          const match = line.match(buildUrlRegex);
-          if (match) {
-            const buildUrl = match[1];
-            await appendLog(`Detected Build URL: ${buildUrl}`);
-            await Build.findByIdAndUpdate(buildId, { buildUrl });
-          }
-        }
-      });
-
-      buildProcess.stderr.on('data', (data) => {
-        const lines = data.toString().split('\n');
-        lines.forEach((line: string) => {
-          if (line.trim()) appendLog(`[EAS BUILD ERROR] ${line}`);
-        });
-      });
-
-      buildProcess.on('close', async (code) => {
-        if (code === 0) {
-          await appendLog('EAS build command completed successfully.');
-          resolve();
-        } else {
-          reject(new Error(`EAS build command failed with exit code ${code}`));
-        }
-      });
-
-      // Safety timeout at 5 minutes
-      setTimeout(() => {
-        buildProcess.kill();
-        reject(new Error('EAS build command timed out after 5 minutes'));
-      }, 300000);
-    });
+    await triggerEasBuildWithRetry(projectRoot, env, buildId, appendLog);
 
     // Fetch the updated build document to check if we captured the build URL
     const finalBuild = await Build.findById(buildId);
